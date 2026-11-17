@@ -5,6 +5,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { forge, clock, type Repo, type Issue, type Pull } from './store.ts';
 import { handleGit } from './git.ts';
+import { pullFiles, mergePull, filesAt as filesAtCommit } from './merge.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 
@@ -172,11 +173,8 @@ function resolveRef(repo: Repo, ref: string | null): string | null {
 }
 
 /** The flat file map at a commit (or an empty map for an unborn branch). */
-function filesAt(repo: Repo, commitSha: string | null): Map<string, { sha: string; mode: string }> {
-  if (!commitSha) return new Map();
-  const commit = forge.objects.readCommit(commitSha);
-  if (!commit) return new Map();
-  return forge.objects.flattenTree(commit.tree);
+function filesAt(_repo: Repo, commitSha: string | null): Map<string, { sha: string; mode: string }> {
+  return filesAtCommit(commitSha);
 }
 
 /** Parse a git identity line "Name <email> 1700000000 +0000" for the REST commit shape. */
@@ -203,85 +201,6 @@ function commitJson(sha: string): Record<string, unknown> | null {
     committer: null,
     parents: commit.parents.map((p) => ({ sha: p })),
   };
-}
-
-/** Line-multiset diff counts between two texts. */
-function lineDiff(oldText: string, newText: string): { additions: number; deletions: number } {
-  const count = (text: string): Map<string, number> => {
-    const map = new Map<string, number>();
-    for (const line of text.split('\n')) map.set(line, (map.get(line) ?? 0) + 1);
-    return map;
-  };
-  const a = count(oldText);
-  const b = count(newText);
-  let additions = 0;
-  let deletions = 0;
-  for (const [line, n] of b) additions += Math.max(0, n - (a.get(line) ?? 0));
-  for (const [line, n] of a) deletions += Math.max(0, n - (b.get(line) ?? 0));
-  return { additions, deletions };
-}
-
-/** Three-dot file changes between a pull's merge base and its head. */
-function pullFiles(repo: Repo, pull: Pull): Record<string, unknown>[] {
-  const base = forge.objects.mergeBase(pull.baseSha, pull.headSha) ?? pull.baseSha;
-  const baseFiles = filesAt(repo, base);
-  const headFiles = filesAt(repo, pull.headSha);
-  const out: Record<string, unknown>[] = [];
-  const paths = new Set([...baseFiles.keys(), ...headFiles.keys()]);
-  for (const path of [...paths].sort()) {
-    const before = baseFiles.get(path);
-    const after = headFiles.get(path);
-    if (before?.sha === after?.sha) continue;
-    const oldText = before ? (forge.objects.blobText(before.sha) ?? '') : '';
-    const newText = after ? (forge.objects.blobText(after.sha) ?? '') : '';
-    const { additions, deletions } = lineDiff(oldText, newText);
-    out.push({
-      sha: after?.sha ?? '0000000000000000000000000000000000000000',
-      filename: path,
-      status: !before ? 'added' : !after ? 'removed' : 'modified',
-      additions,
-      deletions,
-      changes: additions + deletions,
-    });
-  }
-  return out;
-}
-
-/**
- * Squash/merge a pull into its base branch. Returns the new commit sha, or 'conflict'.
- * Per-file three-way merge from the merge base: a file both sides changed differently
- * is a conflict; anything else resolves to the changed side.
- */
-function mergePull(repo: Repo, pull: Pull, method: string): string | 'conflict' {
-  const baseTip = repo.branchTip(pull.baseRef) ?? pull.baseSha;
-  const mergeBase = forge.objects.mergeBase(baseTip, pull.headSha) ?? pull.baseSha;
-  const baseFiles = filesAt(repo, mergeBase);
-  const headFiles = filesAt(repo, pull.headSha);
-  const curFiles = filesAt(repo, baseTip);
-  const merged = new Map(curFiles);
-  const paths = new Set([...baseFiles.keys(), ...headFiles.keys(), ...curFiles.keys()]);
-  for (const path of paths) {
-    const b = baseFiles.get(path)?.sha;
-    const h = headFiles.get(path)?.sha;
-    const c = curFiles.get(path)?.sha;
-    if (h === b) continue; // head did not change it; keep current
-    if (c === b || c === h) {
-      const entry = headFiles.get(path);
-      if (entry) merged.set(path, entry);
-      else merged.delete(path);
-      continue;
-    }
-    return 'conflict'; // both sides changed it differently
-  }
-  const message = method === 'merge'
-    ? `Merge pull request #${pull.number} from ${pull.headRef}\n\n${pull.title}\n`
-    : `${pull.title} (#${pull.number})\n${pull.body ? `\n${pull.body}\n` : ''}`;
-  const parents = method === 'merge' ? [baseTip, pull.headSha] : [baseTip];
-  const tree = forge.objects.buildTree(merged);
-  const ident = forge.objects.identity();
-  const sha = forge.objects.writeCommit({ tree, parents, author: ident, committer: ident, message });
-  repo.setBranch(pull.baseRef, sha);
-  return sha;
 }
 
 // --------------------------------------------------------------------------- REST routing
@@ -472,7 +391,12 @@ function handleContents(ctx: Ctx, repo: Repo, rawPath: string): void {
     const message = str(body.message) ?? 'Update file';
     if (contentB64 === null) return sendJson(res, 422, { message: 'Validation Failed.', errors: [{ resource: 'Content', code: 'missing_field', field: 'content' }] });
     const data = Buffer.from(contentB64.replace(/\s+/g, ''), 'base64');
-    const tip = repo.branchTip(branchForWrite);
+    let tip = repo.branchTip(branchForWrite);
+    // A write naming a branch that does not exist yet starts it from the default
+    // branch's tip (the suite creates pull-request head branches this way).
+    if (!tip && branchForWrite !== repo.defaultBranch) {
+      tip = repo.branchTip(repo.defaultBranch);
+    }
     const files = filesAt(repo, tip);
     const existing = files.get(path);
     const givenSha = str(body.sha);

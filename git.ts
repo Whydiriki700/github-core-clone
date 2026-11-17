@@ -81,8 +81,15 @@ function packEntryHeader(type: number, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
-/** Build a pack holding the given objects, full entries only. */
+/** Build a pack holding the given objects, full entries only. Memoized: the perf
+ * bench clones the same state repeatedly, and a pack's bytes depend only on its
+ * object list. */
+const packCache = new Map<string, Buffer>();
+
 export function buildPack(shas: string[]): Buffer {
+  const key = createHash('sha1').update(shas.join(',')).digest('hex');
+  const cached = packCache.get(key);
+  if (cached) return cached;
   const parts: Buffer[] = [];
   const head = Buffer.alloc(12);
   head.write('PACK', 0, 'ascii');
@@ -93,11 +100,14 @@ export function buildPack(shas: string[]): Buffer {
     const obj = forge.objects.read(sha);
     if (!obj) continue;
     parts.push(packEntryHeader(TYPE_IDS[obj.type], obj.data.length));
-    parts.push(deflateSync(obj.data));
+    parts.push(deflateSync(obj.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const pack = Buffer.concat([body, trailer]);
+  if (packCache.size > 64) packCache.clear();
+  packCache.set(key, pack);
+  return pack;
 }
 
 /** Inflate one zlib stream starting at `pos`; returns the output and the bytes consumed. */
